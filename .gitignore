@@ -1,0 +1,16 @@
+# Build output
+bin/
+obj/
+
+# Game DLLs — never commit these, they belong to the game
+MelonLoader/
+*.game.dll
+
+# IDE
+.vs/
+.vscode/
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
