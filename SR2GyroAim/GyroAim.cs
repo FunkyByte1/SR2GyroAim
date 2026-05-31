@@ -7,7 +7,7 @@ using MelonLoader.Preferences;
 using UnityEngine;
 using Il2CppMonomiPark.SlimeRancher.Player.CharacterController;
 
-[assembly: MelonInfo(typeof(SR2GyroAim.GyroMod), "SR2 Gyro Aim", "1.0.0", "FunkyByte1")]
+[assembly: MelonInfo(typeof(SR2GyroAim.GyroMod), "SR2 Gyro Aim", "0.1.1", "FunkyByte1")]
 [assembly: MelonGame("MonomiPark", "SlimeRancher2")]
 
 namespace SR2GyroAim
@@ -38,6 +38,31 @@ namespace SR2GyroAim
         // Camera reference
         private SRCameraController _camera;
 
+        /// <summary>
+        /// Resolve the host machine's LAN IP address.
+        /// Under Proton/Wine, 127.0.0.1 is isolated to the Wine network stack and
+        /// does not reach host services like SteamDeckGyroDSU. Using the LAN IP works.
+        /// Falls back to loopback if no LAN IP is found.
+        /// </summary>
+        private static IPAddress GetHostIP()
+        {
+            try
+            {
+                var hostName = System.Net.Dns.GetHostName();
+                var addresses = System.Net.Dns.GetHostAddresses(hostName);
+                foreach (var addr in addresses)
+                {
+                    if (addr.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(addr))
+                        return addr;
+                }
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning($"Could not resolve host IP, falling back to loopback: {e.Message}");
+            }
+            return IPAddress.Loopback;
+        }
+
         public override void OnInitializeMelon()
         {
             // Set up config — Starlight picks this up automatically for its mod menu
@@ -52,8 +77,9 @@ namespace SR2GyroAim
 
             try
             {
+                var hostIP = GetHostIP();
                 _udp = new UdpClient();
-                _serverEndPoint = new IPEndPoint(IPAddress.Loopback, 26760);
+                _serverEndPoint = new IPEndPoint(hostIP, 26760);
                 _udp.Client.ReceiveTimeout = 1000;
 
                 SendSubscribeRequest();
@@ -62,7 +88,7 @@ namespace SR2GyroAim
                 _receiveThread = new Thread(ReceiveLoop) { IsBackground = true };
                 _receiveThread.Start();
 
-                MelonLogger.Msg("SR2 Gyro Aim started. Cemuhook client listening on 127.0.0.1:26760");
+                MelonLogger.Msg($"SR2 Gyro Aim started. Cemuhook client connecting to {hostIP}:26760");
             }
             catch (Exception e)
             {
@@ -73,86 +99,47 @@ namespace SR2GyroAim
         private void SendSubscribeRequest()
         {
             byte[] packet = new byte[28];
-
-            // Magic: "DSUC" (client)
-            packet[0] = (byte)'D';
-            packet[1] = (byte)'S';
-            packet[2] = (byte)'U';
-            packet[3] = (byte)'C';
-
-            // Protocol version: 1001
+            packet[0] = (byte)'D'; packet[1] = (byte)'S'; packet[2] = (byte)'U'; packet[3] = (byte)'C';
             BitConverter.GetBytes((ushort)1001).CopyTo(packet, 4);
-
-            // Length of packet without header (28 - 16 = 12)
             BitConverter.GetBytes((ushort)12).CopyTo(packet, 6);
-
-            // CRC32 placeholder (filled below)
             BitConverter.GetBytes((uint)0).CopyTo(packet, 8);
-
-            // Client ID
             BitConverter.GetBytes((uint)12345678).CopyTo(packet, 12);
-
-            // Message type: 0x100002 = controller data request
             BitConverter.GetBytes((uint)0x100002).CopyTo(packet, 16);
-
-            // Payload: flag=0 (subscribe to all), slot=0, MAC=000000000000
-            packet[20] = 0;
-            packet[21] = 0;
-
+            packet[20] = 0; packet[21] = 0;
             uint crc = Crc32(packet);
             BitConverter.GetBytes(crc).CopyTo(packet, 8);
-
             _udp.Send(packet, packet.Length, _serverEndPoint);
         }
 
         private void ReceiveLoop()
         {
             DateTime lastSubscribe = DateTime.Now;
-
             while (_running)
             {
                 try
                 {
-                    // Re-subscribe every 3 seconds as required by the protocol
                     if ((DateTime.Now - lastSubscribe).TotalSeconds > 3)
                     {
                         SendSubscribeRequest();
                         lastSubscribe = DateTime.Now;
                     }
-
                     IPEndPoint remote = new IPEndPoint(IPAddress.Any, 0);
                     byte[] data = _udp.Receive(ref remote);
-
                     if (data.Length < 100) continue;
-
-                    // Check magic "DSUS" (server message)
                     if (data[0] != 'D' || data[1] != 'S' || data[2] != 'U' || data[3] != 'S') continue;
-
-                    // Message type at offset 16
                     uint msgType = BitConverter.ToUInt32(data, 16);
                     if (msgType != 0x100002) continue;
-
-                    // Gyro offsets relative to payload start (byte 20):
-                    // pitch=68, yaw=72, roll=76 — values in deg/s
                     _gyroPitch = BitConverter.ToSingle(data, 20 + 68);
                     _gyroYaw   = BitConverter.ToSingle(data, 20 + 72);
                     _gyroRoll  = BitConverter.ToSingle(data, 20 + 76);
                 }
-                catch (SocketException)
-                {
-                    // Timeout is normal — just loop and resubscribe
-                }
-                catch (Exception e)
-                {
-                    MelonLogger.Error($"Receive error: {e.Message}");
-                }
+                catch (SocketException) { }
+                catch (Exception e) { MelonLogger.Error($"Receive error: {e.Message}"); }
             }
         }
 
         private static float ApplyDeadzone(float value, float deadzone)
-        {
-            return Mathf.Abs(value) < deadzone ? 0f : value;
-        }
+            => Mathf.Abs(value) < deadzone ? 0f : value;
 
         public override void OnUpdate()
         {
@@ -164,10 +151,9 @@ namespace SR2GyroAim
 
             float dt       = Time.deltaTime;
             float deadzone = _deadzone.Value;
-
-            float pan   = ApplyDeadzone(_gyroRoll,  deadzone);
-            float tilt  = ApplyDeadzone(_gyroPitch, deadzone);
-            float twist = ApplyDeadzone(_gyroYaw,   deadzone);
+            float pan      = ApplyDeadzone(_gyroRoll,  deadzone);
+            float tilt     = ApplyDeadzone(_gyroPitch, deadzone);
+            float twist    = ApplyDeadzone(_gyroYaw,   deadzone);
 
             float invertPan   = _invertPan.Value   ? 1f : -1f;
             float invertTilt  = _invertTilt.Value  ? 1f : -1f;
@@ -178,12 +164,9 @@ namespace SR2GyroAim
 
             if (Mathf.Abs(yawDelta) < 0.001f && Mathf.Abs(pitchDelta) < 0.001f) return;
 
-            // Apply yaw by rotating the planar direction vector
             Vector3 dir = _camera._planarDirection;
             dir = Quaternion.AngleAxis(yawDelta, Vector3.up) * dir;
             _camera._planarDirection = dir;
-
-            // Apply pitch
             _camera._targetVerticalAngle += pitchDelta;
         }
 
@@ -194,7 +177,6 @@ namespace SR2GyroAim
             _receiveThread?.Join(500);
         }
 
-        // Standard CRC32 implementation
         private static uint Crc32(byte[] data)
         {
             uint crc = 0xFFFFFFFF;
